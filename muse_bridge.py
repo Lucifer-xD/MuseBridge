@@ -515,6 +515,12 @@ class _TaskStepReader:
       const row = document.querySelector(sel);
       return row ? (row.innerText || '').replace(/\s+/g, ' ').trim() : '';
     }"""
+    # A row reads "<task title>\n<latest step>\n<time>"; the title alone identifies the task.
+    _TOP_TITLE_JS = r"""(sel) => {
+      const row = document.querySelector(sel);
+      if (!row) return '';
+      return ((row.innerText || '').split('\n').map(s => s.trim()).find(s => s)) || '';
+    }"""
     _DIALOG_STEPS_JS = r"""() => {
       const d = document.querySelector('[role=dialog]');
       if (!d) return null;
@@ -522,13 +528,36 @@ class _TaskStepReader:
         .map(b => (b.innerText || '').replace(/\s+/g, ' ').trim())
         .filter(t => t);
     }"""
+    # The popup opens with a status badge: "In Progress", "Complete", "Failed", "Interrupted".
+    _DIALOG_STATUS_JS = r"""() => {
+      const d = document.querySelector('[role=dialog]');
+      if (!d) return null;
+      const first = (d.innerText || '').split('\n').map(s => s.trim()).find(s => s);
+      return first || '';
+    }"""
 
     def __init__(self, page: Page):
         self.page = page
         self.opened = False
+        self.opened_title = ""
         self.seen: set = set()
         self.baseline_row = self._top_row()
         self.stale_summary = _read_live_step(page)
+
+    def busy(self) -> bool:
+        """True while the task Muse started for this prompt is still running.
+
+        Muse is an agent: it can post an interim message ("I'll give you the verdict once
+        I've checked them all") and keep working. Its reply is only final once the task
+        badge leaves "In Progress".
+        """
+        if not self.opened:
+            return False
+        try:
+            status = (self.page.evaluate(self._DIALOG_STATUS_JS) or "").lower()
+        except Exception:
+            return False
+        return status.startswith("in progress")
 
     def _top_row(self) -> str:
         try:
@@ -543,6 +572,18 @@ class _TaskStepReader:
         self.seen.update(new)
         return new
 
+    def _top_title(self) -> str:
+        try:
+            return self.page.evaluate(self._TOP_TITLE_JS, self.ROW_SEL) or ""
+        except Exception:
+            return ""
+
+    def _open_top_task(self) -> None:
+        self.page.locator(self.ROW_SEL).first.click(timeout=2000)
+        self.page.wait_for_timeout(400)
+        self.opened = True
+        self.opened_title = self._top_title()
+
     def poll(self) -> List[str]:
         try:
             if not self.opened:
@@ -551,9 +592,14 @@ class _TaskStepReader:
                     # No task row for this prompt yet: fall back to the chat's one-line summary.
                     s = _read_live_step(self.page)
                     return self._fresh([s]) if s and s != self.stale_summary else []
-                self.page.locator(self.ROW_SEL).first.click(timeout=2000)
-                self.page.wait_for_timeout(400)
-                self.opened = True
+                self._open_top_task()
+            elif not self.busy():
+                # Our task finished; if Muse kicked off another one for this prompt (e.g. a
+                # background job), follow that instead.
+                title = self._top_title()
+                if title and title != self.opened_title:
+                    self.close()
+                    self._open_top_task()
             steps = self.page.evaluate(self._DIALOG_STEPS_JS)
             if steps is None:
                 self.opened = False  # popup closed under us (re-render); reopen next poll
@@ -578,6 +624,7 @@ def _wait_for_reply(
     timeout_s: int = DEFAULT_TIMEOUT,
     prompt_text: str = "",
     progress_cb=None,
+    busy_cb=None,
 ) -> str:
     """Wait for assistant response to stream and settle."""
     deadline = time.time() + timeout_s
@@ -684,6 +731,20 @@ def _wait_for_reply(
 
         if poll_count % 8 == 0:
             print(f"[*] Stream settling ({poll_count * POLL_INTERVAL_S:.1f}s): bubbles={len(msgs)}, assistant_msgs={len(assistant_msgs)}, chars={len(cur_text)}, is_gen={is_gen}, seen_gen={seen_generating}, stable={stable_count}/{SETTLE_POLLS}", file=sys.stderr, flush=True)
+
+        # Muse is an agent: an interim message ("I'll give you the verdict once I've checked
+        # them all") is not the answer while its task is still In Progress. Keep collecting.
+        if busy_cb is not None:
+            try:
+                task_busy = bool(busy_cb())
+            except Exception:
+                task_busy = False
+            if task_busy:
+                if poll_count % 8 == 0:
+                    print("[*] Muse task still in progress; waiting for it to finish.", file=sys.stderr, flush=True)
+                stable_count = 0
+                last_text = cur_text
+                continue
 
         # 5. Settle check:
         # If Muse was actively generating and has now stopped (Stop button disappeared), and text is stable:
@@ -1215,6 +1276,7 @@ class BrowserManager:
                                 reply = _wait_for_reply(
                                     page, msg_sel, n_before, timeout_s=timeout_s, prompt_text=text,
                                     progress_cb=_on_poll,
+                                    busy_cb=reader.busy,
                                 )
                             finally:
                                 reader.close()
