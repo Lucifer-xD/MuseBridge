@@ -2441,17 +2441,19 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                             new_lines = lines[sent_steps:]
                             sent_steps = len(lines)
                             try:
+                                # Steps go in a "thinking" block: OpenCode shows it animated while
+                                # streaming, then collapses it to one clickable line above the answer.
                                 if not self._progress_open:
                                     self._send_sse("content_block_start", {
                                         "type": "content_block_start",
                                         "index": 0,
-                                        "content_block": {"type": "text", "text": ""},
+                                        "content_block": {"type": "thinking", "thinking": ""},
                                     })
                                     self._progress_open = True
                                 self._send_sse("content_block_delta", {
                                     "type": "content_block_delta",
                                     "index": 0,
-                                    "delta": {"type": "text_delta", "text": "".join(f"• {s}\n" for s in new_lines)},
+                                    "delta": {"type": "thinking_delta", "thinking": "".join(f"{s}\n" for s in new_lines)},
                                 })
                             except Exception:
                                 break
@@ -2461,6 +2463,18 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                 self.wfile.flush()
                             except Exception:
                                 break
+
+                    # Close the thinking block before the answer streams in its own block.
+                    if self._progress_open:
+                        try:
+                            self._send_sse("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "signature_delta", "signature": "muse-steps"},
+                            })
+                            self._send_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+                        except Exception:
+                            pass
 
                     if "error" in res_box:
                         raise res_box["error"]
@@ -2832,33 +2846,27 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                             })
                             stream_headers_sent[0] = True
 
-                        if not getattr(self, "_progress_open", False):
-                            self._send_sse("content_block_start", {
-                                "type": "content_block_start",
-                                "index": 0,
-                                "content_block": {"type": "text", "text": ""},
-                            })
-                        else:
-                            # Progress lines already streamed into block 0; separate them from the answer.
-                            self._send_sse("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": "\n"},
-                            })
+                        # If steps streamed as a thinking block (index 0), the answer is a new block.
+                        ans_idx = 1 if getattr(self, "_progress_open", False) else 0
+                        self._send_sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": ans_idx,
+                            "content_block": {"type": "text", "text": ""},
+                        })
 
                         chunk_size = 40
                         for i in range(0, len(clean_reply), chunk_size):
                             chunk = clean_reply[i:i + chunk_size]
                             self._send_sse("content_block_delta", {
                                 "type": "content_block_delta",
-                                "index": 0,
+                                "index": ans_idx,
                                 "delta": {"type": "text_delta", "text": chunk},
                             })
                             time.sleep(0.01)
 
                         self._send_sse("content_block_stop", {
                             "type": "content_block_stop",
-                            "index": 0,
+                            "index": ans_idx,
                         })
 
                         self._send_sse("message_delta", {
