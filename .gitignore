@@ -40,3 +40,6 @@ env/
 .claude/
 .idea/
 .vscode/
+
+# Contains the PC Commander key
+send_to_muse_connector.txt

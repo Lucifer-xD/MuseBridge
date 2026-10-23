@@ -81,6 +81,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+HARNESS_NOTE = (
+    "(I'm asking about my own Windows PC, not your computer; I'm working in {cwd}. "
+    "Please don't run anything on your side. If answering needs something from my PC, just reply with the "
+    "PowerShell command in one ```powershell code block and I'll run it and paste you the output. "
+    "If I ask for files, give each one as ### `path` followed by a code block with the full content.)"
+)
+
+
+def harness_note_enabled() -> bool:
+    """Set "harness_note": false in bridge_config.json to send prompts unmodified."""
+    return bool(load_config().get("harness_note", True))
+
+
 def load_config() -> Dict[str, Any]:
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_FILE.exists():
@@ -328,25 +341,108 @@ def _click_send(page: Page, send_btn_selector: str, composer_selector: str) -> N
     page.wait_for_timeout(600)
 
 
+# Muse renders replies as styled HTML; inner_text() flattens them and drops the markdown
+# markers (**, #, |, ```), so clients like OpenCode get a gray wall. Rebuild markdown from
+# the DOM instead, so headings, bold, tables and fenced code survive to the client.
+_MSG_TO_MARKDOWN_JS = r"""
+el => {
+  const BT = String.fromCharCode(96);
+  const F = BT + BT + BT;
+  function inline(node){
+    let out = '';
+    node.childNodes.forEach(c => {
+      if (c.nodeType === 3) { out += c.textContent; return; }
+      if (c.nodeType !== 1) return;
+      const tag = c.tagName.toLowerCase();
+      if (tag === 'strong' || tag === 'b') out += '**' + inline(c) + '**';
+      else if (tag === 'em' || tag === 'i') out += '*' + inline(c) + '*';
+      else if (tag === 'del' || tag === 's') out += '~~' + inline(c) + '~~';
+      else if (tag === 'code') out += BT + c.textContent + BT;
+      else if (tag === 'a') out += '[' + inline(c) + '](' + (c.getAttribute('href') || '') + ')';
+      else if (tag === 'br') out += '\n';
+      else out += inline(c);
+    });
+    return out;
+  }
+  function block(node){
+    let out = '';
+    node.childNodes.forEach(c => {
+      if (c.nodeType === 3) { const t = c.textContent.replace(/\s+/g, ' ').trim(); if (t) out += t + '\n\n'; return; }
+      if (c.nodeType !== 1) return;
+      const tag = c.tagName.toLowerCase();
+      if (/^h[1-6]$/.test(tag)) out += '#'.repeat(parseInt(tag[1])) + ' ' + inline(c).trim() + '\n\n';
+      else if (tag === 'p') { const t = inline(c).trim(); if (t) out += t + '\n\n'; }
+      else if (tag === 'ul') { c.querySelectorAll(':scope > li').forEach(li => { out += '- ' + inline(li).trim() + '\n'; }); out += '\n'; }
+      else if (tag === 'ol') { let i = 1; c.querySelectorAll(':scope > li').forEach(li => { out += (i++) + '. ' + inline(li).trim() + '\n'; }); out += '\n'; }
+      else if (tag === 'blockquote') out += '> ' + inline(c).trim().replace(/\n/g, '\n> ') + '\n\n';
+      else if (tag === 'pre') { const code = c.querySelector('code'); let lang = ''; if (code) { const m = (code.className || '').match(/language-([\w-]+)/); if (m) lang = m[1]; } const txt = ((code || c).textContent || '').replace(/\n+$/, ''); out += F + lang + '\n' + txt + '\n' + F + '\n\n'; }
+      else if (tag === 'hr') out += '---\n\n';
+      else if (tag === 'table') {
+        const rows = [...c.querySelectorAll('tr')];
+        rows.forEach((r, ri) => {
+          const cells = [...r.querySelectorAll('th,td')].map(x => inline(x).trim().replace(/\n/g, ' '));
+          out += '| ' + cells.join(' | ') + ' |\n';
+          if (ri === 0) out += '| ' + cells.map(() => '---').join(' | ') + ' |\n';
+        });
+        out += '\n';
+      }
+      else out += block(c);
+    });
+    return out;
+  }
+  return block(el).replace(/\n{3,}/g, '\n\n').trim();
+}
+"""
+
+
+_FENCE_LANGS = {
+    "python", "py", "javascript", "js", "typescript", "ts", "bash", "sh", "shell",
+    "powershell", "ps1", "pwsh", "json", "html", "css", "cpp", "c", "java", "go",
+    "golang", "rust", "rs", "ruby", "rb", "php", "sql", "yaml", "yml", "xml", "toml",
+    "text", "plaintext", "diff", "markdown", "md", "dockerfile", "ini",
+}
+
+
+def _fix_code_fence_lang(md: str) -> str:
+    """Muse puts the code language on its own line above the fence; fold it into the fence."""
+    def repl(m):
+        if m.group(1).lower() in _FENCE_LANGS:
+            return "```" + m.group(1) + "\n"
+        return m.group(0)
+    return re.sub(r"(?m)^([A-Za-z0-9+#.\-]{1,15})\n+```\n", repl, md)
+
+
 def _extract_messages(page: Page, message_selector: str) -> List[Dict[str, str]]:
     """Extract message items as list of {'author': str, 'text': str}."""
     sel = message_selector or ".hatch-chat-groupable-bubble"
+    # One snapshot of every bubble in a single round trip. Reading bubbles one by one through
+    # locator.nth(i) auto-waits up to 30s whenever Muse's virtualized list drops a bubble
+    # mid-read, which stalled replies for minutes.
     try:
-        loc = page.locator(sel)
-        count = loc.count()
+        snapshot = page.evaluate(
+            "(sel) => { const toMd = " + _MSG_TO_MARKDOWN_JS.strip() + ";\n"
+            "  return [...document.querySelectorAll(sel)].map(el => {\n"
+            "    let md = ''; try { md = toMd(el); } catch (e) {}\n"
+            "    return { cls: String(el.className || ''), md: md, txt: el.innerText || '' };\n"
+            "  }); }",
+            sel,
+        ) or []
     except Exception:
         return []
 
     out = []
-    for i in range(count):
-        el = loc.nth(i)
+    for item in snapshot:
         try:
-            # Note: Do NOT filter with is_visible() here because long chat containers
-            # clip off-screen bubbles, but inner_text() remains accessible in the DOM.
-            text = el.inner_text().strip()
+            # Note: no is_visible() filter; long chat containers clip off-screen bubbles,
+            # but their DOM text remains accessible.
+            text = (item.get("md") or "").strip()
+            if text:
+                text = _fix_code_fence_lang(text)
+            else:
+                text = (item.get("txt") or "").strip()
             if not text:
                 continue
-            classes = el.get_attribute("class") or ""
+            classes = item.get("cls") or ""
             is_user = (
                 "bg-chat-user-bubble" in classes
                 or "user" in classes.lower()
@@ -388,12 +484,100 @@ def _is_generating(page: Page) -> bool:
     return False
 
 
+def _read_live_step(page: Page) -> str:
+    """Return the short label of the step Muse is currently on, for live progress streaming."""
+    try:
+        return page.evaluate(r"""() => {
+          const main = document.querySelector('main') || document.body;
+          const want = /^(Running:|Wrote |Built |Listed |Cleared |Updated |Created |Searched |Reading |Editing |Deleted |Ran |Executing |Checking |Enabled |Saved |Verified |Downloaded |Opened |Installed |Testing |Staging test|Analyzing |Inspecting )/;
+          const walker = document.createTreeWalker(main, NodeFilter.SHOW_TEXT);
+          let n, last = "";
+          while ((n = walker.nextNode())) {
+            const t = n.textContent.trim();
+            if (t && want.test(t)) last = t;
+          }
+          return last.slice(0, 140);
+        }""") or ""
+    except Exception:
+        return ""
+
+
+class _TaskStepReader:
+    """Reports the steps of the task Muse starts for a prompt, as listed in its task popup.
+
+    The chat column only shows a one-line summary of a running task; the full step list
+    ("Read ~/MEMORY.md", "Found 0 memory results ...") lives in the popup you get by
+    clicking the task row. Once a new task row appears, open its popup and read the steps.
+    """
+
+    ROW_SEL = "button:has(div.text-footnote.text-text-secondary)"
+    _TOP_ROW_JS = r"""(sel) => {
+      const row = document.querySelector(sel);
+      return row ? (row.innerText || '').replace(/\s+/g, ' ').trim() : '';
+    }"""
+    _DIALOG_STEPS_JS = r"""() => {
+      const d = document.querySelector('[role=dialog]');
+      if (!d) return null;
+      return [...d.querySelectorAll('button')]
+        .map(b => (b.innerText || '').replace(/\s+/g, ' ').trim())
+        .filter(t => t);
+    }"""
+
+    def __init__(self, page: Page):
+        self.page = page
+        self.opened = False
+        self.seen: set = set()
+        self.baseline_row = self._top_row()
+        self.stale_summary = _read_live_step(page)
+
+    def _top_row(self) -> str:
+        try:
+            return self.page.evaluate(self._TOP_ROW_JS, self.ROW_SEL) or ""
+        except Exception:
+            return ""
+
+    def _fresh(self, steps: List[str]) -> List[str]:
+        # Muse wraps quoted parts in invisible bidi isolate marks (U+2066..U+2069); drop them.
+        steps = [re.sub("[⁦-⁩]", "", s or "") for s in steps]
+        new = [s for s in steps if s and s not in self.seen]
+        self.seen.update(new)
+        return new
+
+    def poll(self) -> List[str]:
+        try:
+            if not self.opened:
+                row = self._top_row()
+                if not row or row == self.baseline_row:
+                    # No task row for this prompt yet: fall back to the chat's one-line summary.
+                    s = _read_live_step(self.page)
+                    return self._fresh([s]) if s and s != self.stale_summary else []
+                self.page.locator(self.ROW_SEL).first.click(timeout=2000)
+                self.page.wait_for_timeout(400)
+                self.opened = True
+            steps = self.page.evaluate(self._DIALOG_STEPS_JS)
+            if steps is None:
+                self.opened = False  # popup closed under us (re-render); reopen next poll
+                return []
+            return self._fresh(steps)
+        except Exception:
+            return []
+
+    def close(self) -> None:
+        if self.opened:
+            try:
+                self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            self.opened = False
+
+
 def _wait_for_reply(
     page: Page,
     message_selector: str,
     n_before: int = 0,
     timeout_s: int = DEFAULT_TIMEOUT,
     prompt_text: str = "",
+    progress_cb=None,
 ) -> str:
     """Wait for assistant response to stream and settle."""
     deadline = time.time() + timeout_s
@@ -428,6 +612,15 @@ def _wait_for_reply(
             }""")
         except Exception:
             pass
+
+        # 1b. Let the caller collect live task steps for progress streaming
+        if progress_cb is not None:
+            try:
+                progress_cb()
+            except Exception:
+                pass
+        if poll_count % 8 == 0:
+            print(f"[debug] poll {poll_count} at {time.time() - (deadline - timeout_s):.1f}s", file=sys.stderr, flush=True)
 
         # 2. Extract current messages in the DOM
         msgs = _extract_messages(page, message_selector)
@@ -959,6 +1152,9 @@ class BrowserManager:
         self.url = ""
         self.error: Optional[Exception] = None
         self.thread: Optional[threading.Thread] = None
+        # Task steps seen for the current prompt, appended by the worker thread and streamed
+        # by the HTTP thread. Cleared (by reassignment) before each prompt, appended in place.
+        self.progress_lines: List[str] = []
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -1006,9 +1202,22 @@ class BrowserManager:
                                 pass
                             page.wait_for_timeout(1000)
                             n_before = len(_extract_messages(page, msg_sel))
+                            reader = _TaskStepReader(page)  # baseline taken before sending
+
+                            def _on_poll() -> None:
+                                for s in reader.poll():
+                                    print(f"[debug] step: {s}", file=sys.stderr, flush=True)
+                                    self.progress_lines.append(s)
+
                             _fill_composer(page, composer_sel, text)
                             _click_send(page, send_sel, composer_sel)
-                            reply = _wait_for_reply(page, msg_sel, n_before, timeout_s=timeout_s, prompt_text=text)
+                            try:
+                                reply = _wait_for_reply(
+                                    page, msg_sel, n_before, timeout_s=timeout_s, prompt_text=text,
+                                    progress_cb=_on_poll,
+                                )
+                            finally:
+                                reader.close()
                             extracted = _download_and_extract_recent_archives(page, req_cwd, n_before=n_before)
                             res_q.put(("ok", (reply, extracted)))
                         except Exception as ex:
@@ -1061,6 +1270,7 @@ class BrowserManager:
 
     def send_prompt(self, text: str, timeout_s: int = DEFAULT_TIMEOUT, cwd: str = "") -> Tuple[str, List[str]]:
         with self.lock:
+            self.progress_lines = []
             res_q = queue.Queue()
             self.task_queue.put(("send", text, timeout_s, res_q, cwd))
             try:
@@ -1801,6 +2011,10 @@ def _detect_tool_calls(reply: str, tool_names: set, cwd: str, default_fname: str
 
         # Check bash/powershell code fence
         m_cmd = re.search(r"```(?:bash|sh|powershell|cmd|shell)\n+(.*?)\n+```", block, flags=re.DOTALL)
+        if not m_cmd:
+            # Muse renders code blocks as widgets, so inner_text() loses the fences and leaves
+            # a bare language label line followed by the code, ending at a blank line.
+            m_cmd = re.search(r"(?m)^(?:powershell|pwsh|bash|sh|cmd|shell)[ \t]*\n(.+?)(?=\n[ \t]*\n|\Z)", block, flags=re.DOTALL)
         if m_cmd and ("Bash" in tool_names or "PowerShell" in tool_names):
             cmd = m_cmd.group(1).strip()
             t_name = "PowerShell" if "PowerShell" in tool_names else "Bash"
@@ -1980,6 +2194,17 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                 model_name = payload.get("model", "claude-3-5-sonnet-20241022")
                 is_stream = payload.get("stream", False)
                 msg_id = f"msg_muse_{int(time.time())}"
+                # Live step streaming: only for chat-only clients (e.g. OpenCode), where Muse
+                # acts via its own connectors and returns no tool calls. Claude Code is untouched.
+                self._progress_open = False
+                # OpenCode sends its own lowercase tools (bash, read, ...), which this bridge never
+                # emits calls for, so its replies are always plain text: safe to stream steps into.
+                cc_tools = {"PowerShell", "Bash", "Write", "Read", "Edit", "Glob", "FileWrite", "FileRead"}
+                # Chat-only clients (OpenCode) get no tool calls from this bridge: Muse acts through its
+                # own connectors, so every prompt goes straight to Muse, untouched by the local shortcuts.
+                chat_only = not (tool_names & cc_tools)
+                progress_enabled = is_stream and chat_only and bool(load_config().get("stream_progress", True))
+                print(f"[debug] request: stream={is_stream} tools={len(tool_names)} progress={progress_enabled}", file=sys.stderr, flush=True)
 
                 # Extract working directory from environment/system prompt
                 cwd = os.getcwd()
@@ -2202,12 +2427,35 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                         except Exception as ex:
                             res_box["error"] = ex
 
+                    mgr.progress_lines = []  # so a previous prompt's steps are never re-sent
                     wt = threading.Thread(target=_call, daemon=True)
                     wt.start()
 
+                    sent_steps = 0
                     while wt.is_alive():
-                        wt.join(timeout=2.0)
-                        if wt.is_alive():
+                        wt.join(timeout=1.0)
+                        if not wt.is_alive():
+                            break
+                        lines = list(getattr(mgr, "progress_lines", []) or [])
+                        if progress_enabled and len(lines) > sent_steps:
+                            new_lines = lines[sent_steps:]
+                            sent_steps = len(lines)
+                            try:
+                                if not self._progress_open:
+                                    self._send_sse("content_block_start", {
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": {"type": "text", "text": ""},
+                                    })
+                                    self._progress_open = True
+                                self._send_sse("content_block_delta", {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "text_delta", "text": "".join(f"• {s}\n" for s in new_lines)},
+                                })
+                            except Exception:
+                                break
+                        else:
                             try:
                                 self.wfile.write(b": ping\n\n")
                                 self.wfile.flush()
@@ -2300,7 +2548,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                         reply = f"Completed action(s) on your computer:\n\n{prev_tool_output}"
                 else:
                     # 0. Direct check: Is this a request to delete all files in current folder?
-                    if is_delete_all_files_query(clean_last_user_msg):
+                    if not chat_only and is_delete_all_files_query(clean_last_user_msg):
                         del_call = detect_delete_intent(clean_last_user_msg, cwd, tool_names)
                         if del_call:
                             thought, t_name, t_input = del_call
@@ -2308,24 +2556,24 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                         else:
                             reply = f"No files were found in your local folder (`{cwd}`) to delete."
                     # 1. Direct check: Is this a request to dump/output all file contents in current folder?
-                    elif is_dump_all_contents_query(clean_last_user_msg):
+                    elif not chat_only and is_dump_all_contents_query(clean_last_user_msg):
                         print(f"[*] Detected dump all files query; reading local folder {cwd}", file=sys.stderr, flush=True)
                         local_contents = get_local_folder_contents(cwd)
                         reply = format_folder_contents(local_contents, cwd)
                     # 2. Direct check: Is this a request to list files in current folder?
-                    elif is_file_list_query(clean_last_user_msg):
+                    elif not chat_only and is_file_list_query(clean_last_user_msg):
                         print(f"[*] Detected list files query; listing local folder {cwd}", file=sys.stderr, flush=True)
                         cleaned_files = list_local_files(cwd)
                         reply = _format_file_list(cleaned_files, cwd)
                     else:
                         # Check first if user prompt is directly asking for a local computer / filesystem action
-                        intent_call = _detect_intent_tool_call(clean_last_user_msg, tool_names, cwd)
+                        intent_call = None if chat_only else _detect_intent_tool_call(clean_last_user_msg, tool_names, cwd)
                         if intent_call:
                             thought, t_name, t_input = intent_call
                             tools_to_emit = [(t_name, t_input)]
                         else:
                             # Check if any local files on user's PC are referenced in the prompt!
-                            ref_files = find_referenced_local_files(clean_last_user_msg, cwd)
+                            ref_files = [] if chat_only else find_referenced_local_files(clean_last_user_msg, cwd)
                             is_edit_request = bool(
                                 re.search(
                                     r"\b(?:add|insert|edit|modify|update|solve|change|replace|overwrite|fix|patch|write\s+(?:the\s+)?solution)\b",
@@ -2356,7 +2604,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                         f"Here is the content of the referenced file from the user's PC:\n"
                                         f"{file_context_str}"
                                     )
-                            elif is_folder_analysis_query(clean_last_user_msg):
+                            elif not chat_only and is_folder_analysis_query(clean_last_user_msg):
                                 local_contents = get_local_folder_contents(cwd)
                                 if local_contents:
                                     file_context_parts = [f"[File: {fname} on user's PC]\n{fcontent.strip()}" for fname, fcontent in local_contents.items()]
@@ -2369,7 +2617,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                     )
                             elif is_title_generation_query(clean_last_user_msg):
                                 prompt_to_send = clean_last_user_msg
-                            elif re.search(r"\b(?:create|make|write|generate|build|implement|develop|platform|architecture|code|deliverable|deliverables|spec|specification|transfer|save|disk|export)\b", clean_last_user_msg, flags=re.IGNORECASE):
+                            elif not chat_only and re.search(r"\b(?:create|make|write|generate|build|implement|develop|platform|architecture|code|deliverable|deliverables|spec|specification|transfer|save|disk|export)\b", clean_last_user_msg, flags=re.IGNORECASE):
                                 prompt_to_send = (
                                     f"{clean_last_user_msg}\n\n"
                                     f"[MANDATORY HARNESS INSTRUCTION: You are driving an automated developer harness on the user's local computer. "
@@ -2383,6 +2631,13 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                             m_target = re.search(r"\b(?:create|make|write|named|file|add|save)\s+[`\"']?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]{1,6})[`\"']?", clean_last_user_msg, flags=re.IGNORECASE)
                             default_fname = m_target.group(1) if m_target else ""
 
+                            # Stand-in for editing Muse's SOUL.md by hand: tell it on every turn where it is.
+                            # Only when the client can run the commands (Claude Code); chat-only clients such as
+                            # OpenCode leave Muse to act through its own connectors (PC Commander).
+                            client_runs_commands = "PowerShell" in tool_names or "Bash" in tool_names
+                            if harness_note_enabled() and client_runs_commands and "MANDATORY HARNESS INSTRUCTION" not in prompt_to_send:
+                                prompt_to_send = f"{prompt_to_send}\n\n{HARNESS_NOTE.format(cwd=cwd)}"
+
                             try:
                                 reply, extracted_files = send_with_keepalive(prompt_to_send, cwd=cwd)
                             except Exception as e:
@@ -2390,7 +2645,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                 return
 
                             # Check if Muse hallucinated putting files into ~/workspace or background execution
-                            if not is_title_generation_query(clean_last_user_msg):
+                            if not chat_only and not is_title_generation_query(clean_last_user_msg):
                                 for retry_attempt in range(2):
                                     if not is_workspace_promise(reply, default_fname=default_fname) or extracted_files:
                                         break
@@ -2425,7 +2680,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                         print(f"[!] Error on workspace promise retry: {ex}", file=sys.stderr, flush=True)
                                         break
 
-                            if extracted_files:
+                            if extracted_files and not chat_only:
                                 file_list_preview = "\n".join(f"- `{f}`" for f in sorted(extracted_files[:25]))
                                 more_count = len(extracted_files) - 25
                                 more_suffix = f"\n- ... and {more_count} more files" if more_count > 0 else ""
@@ -2577,11 +2832,19 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                             })
                             stream_headers_sent[0] = True
 
-                        self._send_sse("content_block_start", {
-                            "type": "content_block_start",
-                            "index": 0,
-                            "content_block": {"type": "text", "text": ""},
-                        })
+                        if not getattr(self, "_progress_open", False):
+                            self._send_sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {"type": "text", "text": ""},
+                            })
+                        else:
+                            # Progress lines already streamed into block 0; separate them from the answer.
+                            self._send_sse("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": "\n"},
+                            })
 
                         chunk_size = 40
                         for i in range(0, len(clean_reply), chunk_size):
