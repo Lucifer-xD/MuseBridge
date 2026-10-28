@@ -617,9 +617,9 @@ class _TaskStepReader:
             if not self.opened:
                 row = self._top_row()
                 if not row or row == self.baseline_row:
-                    # No task row for this prompt yet: fall back to the chat's one-line summary.
-                    s = _read_live_step(self.page)
-                    return self._fresh([s]) if s and s != self.stale_summary else []
+                    # No NEW task yet. Don't scrape the page: on a shared thread that returns
+                    # leftover steps from earlier tasks. A plain Q&A simply has no steps.
+                    return []
                 self._open_top_task()
             elif not self.busy():
                 # Our task finished; if Muse kicked off another one for this prompt (e.g. a
