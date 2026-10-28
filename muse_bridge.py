@@ -637,21 +637,13 @@ class _TaskStepReader:
             running_idx = (len(titles) - 1) if self.busy() else -1
             out: List[str] = []
             for idx, t in enumerate(titles):
-                completed = idx != running_idx
-                want_detail = self.detailed and completed and t.lower() not in self._TRIVIAL
-                if t not in self.seen:
-                    self.seen.add(t)
-                    if want_detail:
-                        body = self._detail(t)
-                        self.detailed_done.add(t)
-                        out.append(f"{t}\n{body}" if body else t)
-                    else:
-                        out.append(t)  # running step: title now, detail once it completes
-                elif want_detail and t not in self.detailed_done:
-                    body = self._detail(t)
-                    self.detailed_done.add(t)
-                    if body:
-                        out.append(f"{t}\n{body}")
+                # Emit each step exactly once, when it has completed (the still-running last step
+                # waits for the next poll). This keeps title and detail together and avoids repeats.
+                if idx == running_idx or t in self.seen or t.lower() in self._TRIVIAL:
+                    continue
+                self.seen.add(t)
+                body = self._detail(t) if self.detailed else ""
+                out.append(f"**{t}**\n{body}" if body else f"**{t}**")
             return out
         except Exception:
             return []
@@ -666,12 +658,15 @@ class _TaskStepReader:
             full = re.sub("[⁦-⁩]", "", full)
             i = full.rfind(title)
             body = full[i + len(title):].strip() if i >= 0 else ""
-            # Drop Muse's internal widget/embed tokens and cap length.
+            # Drop Muse's internal widget/embed tokens, then flatten to one tidy paragraph
+            # (a 4-space indent would render as a markdown code block, and stray newlines
+            # collapse into a wall of text in the harness's thinking view).
             body = re.sub(r"\[\[hatch_widget:[^\]]*\]\]", "", body)
-            body = re.sub(r"(?m)^\s*Embed token:.*$", "", body).strip()
-            if len(body) > 700:
-                body = body[:700].rstrip() + " …"
-            return "\n".join("    " + ln for ln in body.splitlines() if ln.strip())
+            body = re.sub(r"(?m)^\s*Embed token:.*$", "", body)
+            body = re.sub(r"\s+", " ", body).strip()
+            if len(body) > 400:
+                body = body[:400].rstrip() + " …"
+            return body
         except Exception:
             return ""
 
@@ -2768,7 +2763,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                 self._send_sse("content_block_delta", {
                                     "type": "content_block_delta",
                                     "index": 0,
-                                    "delta": {"type": "thinking_delta", "thinking": "".join(f"{s}\n" for s in new_lines)},
+                                    "delta": {"type": "thinking_delta", "thinking": "".join(f"{s}\n\n" for s in new_lines)},
                                 })
                             except Exception:
                                 break
