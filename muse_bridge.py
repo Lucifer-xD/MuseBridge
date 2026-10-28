@@ -413,6 +413,28 @@ def _fix_code_fence_lang(md: str) -> str:
     return re.sub(r"(?m)^([A-Za-z0-9+#.\-]{1,15})\n+```\n", repl, md)
 
 
+def _attach_images(page: Page, image_paths: List[str]) -> None:
+    """Upload images to Muse's composer via its file input, then wait for them to attach."""
+    paths = [p for p in image_paths if p and os.path.isfile(p)]
+    if not paths:
+        return
+    try:
+        inp = page.locator("input[type=file]").first
+        if inp.count() == 0:
+            # Some builds mount the input only after the attach button is clicked.
+            try:
+                page.locator("button[aria-label*='Attach' i]").first.click(timeout=3000)
+                page.wait_for_timeout(500)
+                inp = page.locator("input[type=file]").first
+            except Exception:
+                pass
+        inp.set_input_files(paths, timeout=15000)
+        print(f"[*] Attached {len(paths)} image(s) to Muse.", file=sys.stderr, flush=True)
+        page.wait_for_timeout(3500)  # let the thumbnail(s) upload before sending
+    except Exception as e:
+        print(f"[!] Could not attach images: {e}", file=sys.stderr, flush=True)
+
+
 def _extract_messages(page: Page, message_selector: str) -> List[Dict[str, str]]:
     """Extract message items as list of {'author': str, 'text': str}."""
     sel = message_selector or ".hatch-chat-groupable-bubble"
@@ -536,12 +558,17 @@ class _TaskStepReader:
       const first = (d.innerText || '').split('\n').map(s => s.trim()).find(s => s);
       return first || '';
     }"""
+    _DIALOG_TEXT_JS = r"""() => { const d = document.querySelector('[role=dialog]'); return d ? (d.innerText || '') : ''; }"""
+    # Titles with no useful detail body; stream them as a plain line.
+    _TRIVIAL = ("started", "completed", "complete")
 
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, detailed: bool = True):
         self.page = page
+        self.detailed = detailed
         self.opened = False
         self.opened_title = ""
         self.seen: set = set()
+        self.detailed_done: set = set()
         self.baseline_row = self._top_row()
         self.stale_summary = _read_live_step(page)
 
@@ -605,9 +632,48 @@ class _TaskStepReader:
             if steps is None:
                 self.opened = False  # popup closed under us (re-render); reopen next poll
                 return []
-            return self._fresh(steps)
+            titles = [re.sub("[⁦-⁩]", "", t or "").strip() for t in steps]
+            titles = [t for t in titles if t]
+            running_idx = (len(titles) - 1) if self.busy() else -1
+            out: List[str] = []
+            for idx, t in enumerate(titles):
+                completed = idx != running_idx
+                want_detail = self.detailed and completed and t.lower() not in self._TRIVIAL
+                if t not in self.seen:
+                    self.seen.add(t)
+                    if want_detail:
+                        body = self._detail(t)
+                        self.detailed_done.add(t)
+                        out.append(f"{t}\n{body}" if body else t)
+                    else:
+                        out.append(t)  # running step: title now, detail once it completes
+                elif want_detail and t not in self.detailed_done:
+                    body = self._detail(t)
+                    self.detailed_done.add(t)
+                    if body:
+                        out.append(f"{t}\n{body}")
+            return out
         except Exception:
             return []
+
+    def _detail(self, title: str) -> str:
+        """Click a completed step and read its detail pane (title repeated, then the body)."""
+        try:
+            btn = self.page.locator("[role=dialog] button").filter(has_text=title[:40]).first
+            btn.click(timeout=2000)
+            self.page.wait_for_timeout(250)
+            full = self.page.evaluate(self._DIALOG_TEXT_JS) or ""
+            full = re.sub("[⁦-⁩]", "", full)
+            i = full.rfind(title)
+            body = full[i + len(title):].strip() if i >= 0 else ""
+            # Drop Muse's internal widget/embed tokens and cap length.
+            body = re.sub(r"\[\[hatch_widget:[^\]]*\]\]", "", body)
+            body = re.sub(r"(?m)^\s*Embed token:.*$", "", body).strip()
+            if len(body) > 700:
+                body = body[:700].rstrip() + " …"
+            return "\n".join("    " + ln for ln in body.splitlines() if ln.strip())
+        except Exception:
+            return ""
 
     def close(self) -> None:
         if self.opened:
@@ -1256,7 +1322,7 @@ class BrowserManager:
                     if action == "stop":
                         break
                     elif action == "send":
-                        _, text, timeout_s, res_q, req_cwd = task
+                        _, text, timeout_s, res_q, req_cwd, img_paths = task
                         try:
                             try:
                                 page.wait_for_selector(msg_sel, timeout=5000)
@@ -1264,13 +1330,16 @@ class BrowserManager:
                                 pass
                             page.wait_for_timeout(1000)
                             n_before = len(_extract_messages(page, msg_sel))
-                            reader = _TaskStepReader(page)  # baseline taken before sending
+                            # baseline taken before sending; detailed_steps=false in config -> titles only
+                            reader = _TaskStepReader(page, detailed=bool(load_config().get("detailed_steps", True)))
 
                             def _on_poll() -> None:
                                 for s in reader.poll():
-                                    print(f"[debug] step: {s}", file=sys.stderr, flush=True)
+                                    print(f"[debug] step: {s.splitlines()[0]}", file=sys.stderr, flush=True)
                                     self.progress_lines.append(s)
 
+                            if img_paths:
+                                _attach_images(page, img_paths)
                             _fill_composer(page, composer_sel, text)
                             _click_send(page, send_sel, composer_sel)
                             try:
@@ -1369,11 +1438,11 @@ class BrowserManager:
                 raise RuntimeError(val)
             return val
 
-    def send_prompt(self, text: str, timeout_s: int = DEFAULT_TIMEOUT, cwd: str = "") -> Tuple[str, List[str]]:
+    def send_prompt(self, text: str, timeout_s: int = DEFAULT_TIMEOUT, cwd: str = "", image_paths: Optional[List[str]] = None) -> Tuple[str, List[str]]:
         with self.lock:
             self.progress_lines = []
             res_q = queue.Queue()
-            self.task_queue.put(("send", text, timeout_s, res_q, cwd))
+            self.task_queue.put(("send", text, timeout_s, res_q, cwd, image_paths or []))
             try:
                 status, val = res_q.get(timeout=timeout_s + 30)
             except queue.Empty:
@@ -1410,6 +1479,28 @@ FINISH_FIRST_PREAMBLE = (
     "I'll let you know\" — I only see your final message, so anything you send before the work "
     "is done becomes your whole answer. Work through every step, then reply once.]"
 )
+
+
+_IMG_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+
+
+def _save_request_image(source: dict) -> str:
+    """Save a base64 image block from the request to a temp file; return its path (or '')."""
+    try:
+        if not isinstance(source, dict) or source.get("type") != "base64":
+            return ""  # URL-source images aren't supported by the upload path
+        import base64
+        data = base64.b64decode(source.get("data", ""))
+        ext = _IMG_EXT.get(source.get("media_type", ""), ".png")
+        d = Path(tempfile.gettempdir()) / "muse_uploads"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"img_{int(time.time()*1000)}_{len(data) % 100000}{ext}"
+        with open(path, "wb") as f:
+            f.write(data)
+        return str(path)
+    except Exception as e:
+        print(f"[!] Could not save request image: {e}", file=sys.stderr, flush=True)
+        return ""
 
 
 def _first_user_text(messages: List[dict]) -> str:
@@ -2400,6 +2491,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                         last_user_msg_obj = m
                         break  # CRITICAL: Only inspect the MOST RECENT user message!
 
+                image_paths: List[str] = []
                 if last_user_msg_obj:
                     c = last_user_msg_obj.get("content", "")
                     if isinstance(c, list):
@@ -2414,6 +2506,10 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                                     prev_tool_outputs.append(str(rc))
                                 elif block.get("type") == "text":
                                     parts.append(block.get("text", ""))
+                                elif block.get("type") == "image":
+                                    saved = _save_request_image(block.get("source", {}))
+                                    if saved:
+                                        image_paths.append(saved)
                         if not is_tool_result:
                             last_user_msg = "\n".join(parts)
                     else:
@@ -2552,11 +2648,14 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                     return
 
                 stream_headers_sent = [False]
+                images_pending = list(image_paths)  # uploaded with the first send only, not retries
 
                 def send_with_keepalive(prompt: str, cwd: str) -> Tuple[str, List[str]]:
                     """Send prompt to Muse with immediate SSE headers and periodic keepalive comments to prevent client timeout."""
+                    imgs = images_pending[:]
+                    images_pending.clear()
                     if not is_stream or stream_headers_sent[0]:
-                        return mgr.send_prompt(prompt, cwd=cwd)
+                        return mgr.send_prompt(prompt, cwd=cwd, image_paths=imgs)
 
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -2583,7 +2682,7 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                     res_box: Dict[str, Any] = {}
                     def _call():
                         try:
-                            r, ext = mgr.send_prompt(prompt, cwd=cwd)
+                            r, ext = mgr.send_prompt(prompt, cwd=cwd, image_paths=imgs)
                             res_box["reply"] = r
                             res_box["extracted"] = ext
                         except Exception as ex:
