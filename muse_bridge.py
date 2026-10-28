@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -1281,6 +1282,10 @@ class BrowserManager:
                             finally:
                                 reader.close()
                             extracted = _download_and_extract_recent_archives(page, req_cwd, n_before=n_before)
+                            try:
+                                self.url = page.url  # a new chat gets its thread id only after the first send
+                            except Exception:
+                                pass
                             res_q.put(("ok", (reply, extracted)))
                         except Exception as ex:
                             res_q.put(("error", str(ex)))
@@ -1289,6 +1294,28 @@ class BrowserManager:
                         try:
                             msgs = _extract_messages(page, msg_sel)
                             res_q.put(("ok", msgs[-limit:]))
+                        except Exception as ex:
+                            res_q.put(("error", str(ex)))
+                    elif action == "new_chat":
+                        _, res_q = task
+                        try:
+                            # Clicking the composer's "New side chat" is more reliable than a URL.
+                            print("[Daemon] Opening a new Muse side chat...", file=sys.stderr, flush=True)
+                            page.goto("https://muse.ai/", timeout=60_000)
+                            page.wait_for_timeout(1500)
+                            try:
+                                page.get_by_role("button", name="Chats").first.click(timeout=5000)
+                                page.wait_for_timeout(1000)
+                            except Exception:
+                                pass
+                            page.locator("[data-testid=hatch-chat-compose]").first.click(timeout=6000)
+                            page.wait_for_timeout(2000)
+                            try:
+                                page.wait_for_selector(composer_sel, timeout=15_000)
+                            except Exception:
+                                pass
+                            self.url = page.url
+                            res_q.put(("ok", page.url))
                         except Exception as ex:
                             res_q.put(("error", str(ex)))
                     elif action == "navigate":
@@ -1317,6 +1344,18 @@ class BrowserManager:
 
     def stop(self) -> None:
         self.task_queue.put(("stop",))
+
+    def new_chat(self) -> str:
+        with self.lock:
+            res_q = queue.Queue()
+            self.task_queue.put(("new_chat", res_q))
+            try:
+                status, val = res_q.get(timeout=90)
+            except queue.Empty:
+                raise RuntimeError("Muse new-chat timed out.")
+            if status == "error":
+                raise RuntimeError(val)
+            return val
 
     def navigate(self, new_url: str) -> str:
         with self.lock:
@@ -1354,6 +1393,67 @@ class BrowserManager:
             if status == "error":
                 raise RuntimeError(val)
             return val
+
+
+# --- Per-session Muse threads -------------------------------------------------
+# Each OpenCode/ZadLoop session gets its own Muse chat. A session is keyed by its first
+# user message plus its working dir (both stable when the client resumes the session), so
+# a resumed session continues its own thread and a new one starts a fresh thread.
+SESSIONS_FILE = BASE_DIR / "sessions.json"
+_sessions_lock = threading.Lock()
+
+# Prepended to the first message of a new Muse thread: Muse is an agent that likes to send
+# an "on it, will report back" note; this makes it answer once, at the end.
+FINISH_FIRST_PREAMBLE = (
+    "[How to answer me here: do the whole task first, then send ONE final message with the "
+    "result. Do not reply with an acknowledgement, a progress note, or \"I'm working on it / "
+    "I'll let you know\" — I only see your final message, so anything you send before the work "
+    "is done becomes your whole answer. Work through every step, then reply once.]"
+)
+
+
+def _first_user_text(messages: List[dict]) -> str:
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content", "")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            parts = [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
+def session_key_for(messages: List[dict], cwd: str) -> str:
+    base = (cwd or "") + "\n" + strip_system_tags(_first_user_text(messages))[:2000]
+    return hashlib.sha1(base.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _load_sessions() -> Dict[str, str]:
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def sessions_get(key: str) -> str:
+    with _sessions_lock:
+        return _load_sessions().get(key, "")
+
+
+def sessions_set(key: str, thread_url: str) -> None:
+    with _sessions_lock:
+        data = _load_sessions()
+        data[key] = thread_url
+        try:
+            with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[!] Could not save session map: {e}", file=sys.stderr, flush=True)
 
 
 def strip_system_tags(text: str) -> str:
@@ -2714,11 +2814,39 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                             if harness_note_enabled() and client_runs_commands and "MANDATORY HARNESS INSTRUCTION" not in prompt_to_send:
                                 prompt_to_send = f"{prompt_to_send}\n\n{HARNESS_NOTE.format(cwd=cwd)}"
 
+                            # Route this session to its own Muse chat: continue its thread, or start fresh.
+                            session_key = ""
+                            is_new_session = False
+                            if chat_only:
+                                session_key = session_key_for(messages, cwd)
+                                mapped = sessions_get(session_key)
+                                if mapped and "/thread/" in mapped:
+                                    print(f"[*] Session {session_key}: continuing {mapped}", file=sys.stderr, flush=True)
+                                    try:
+                                        mgr.navigate(mapped)
+                                    except Exception as e:
+                                        print(f"[!] Could not open session thread: {e}", file=sys.stderr, flush=True)
+                                else:
+                                    is_new_session = True
+                                    print(f"[*] Session {session_key}: starting a new Muse chat", file=sys.stderr, flush=True)
+                                    try:
+                                        mgr.new_chat()
+                                    except Exception as e:
+                                        print(f"[!] Could not start new Muse chat: {e}", file=sys.stderr, flush=True)
+                                    if FINISH_FIRST_PREAMBLE not in prompt_to_send:
+                                        prompt_to_send = f"{FINISH_FIRST_PREAMBLE}\n\n{prompt_to_send}"
+
                             try:
                                 reply, extracted_files = send_with_keepalive(prompt_to_send, cwd=cwd)
                             except Exception as e:
                                 self._send_json(500, {"error": str(e)})
                                 return
+
+                            if chat_only and is_new_session and session_key:
+                                new_url = getattr(mgr, "url", "") or ""
+                                if "/thread/" in new_url and not new_url.rstrip("/").endswith("/new"):
+                                    sessions_set(session_key, new_url)
+                                    print(f"[*] Mapped session {session_key} -> {new_url}", file=sys.stderr, flush=True)
 
                             # Check if Muse hallucinated putting files into ~/workspace or background execution
                             if not chat_only and not is_title_generation_query(clean_last_user_msg):

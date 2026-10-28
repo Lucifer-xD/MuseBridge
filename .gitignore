@@ -43,3 +43,8 @@ env/
 
 # Contains the PC Commander key
 send_to_muse_connector.txt
+storage_state.*.json
+bridge_config.*.json
+
+# Per-session Muse thread map
+sessions.json
