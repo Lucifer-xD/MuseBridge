@@ -1,361 +1,201 @@
-# Muse ↔ Claude Code Bridge
+<div align="center">
 
-> Turn Meta's **Muse AI** (`muse.ai`, 1B token referral tier) into a complete, free, production-grade **Coding Agent Harness** for **Claude Code**, Cursor, and local coding tools via automated Playwright Chromium sessions.
+# 🌉 MuseBridge
 
----
+### Use **Meta Muse** inside your favourite coding apps — with live steps, images, and its own memory.
 
-## Table of Contents
-- [Overview](#overview)
-- [The 5 Harness Pillars](#the-5-harness-pillars)
-- [Complete Step-by-Step Setup](#complete-step-by-step-setup)
-  - [Step 1: Prerequisites & Installation](#step-1-prerequisites--installation)
-  - [Step 2: One-Time Login & Selector Discovery](#step-2-one-time-login--selector-discovery)
-  - [Step 3: Crucial! Configure Muse SOUL.md & MEMORY.md](#step-3-crucial-configure-muse-soulmd--memorymd)
-  - [Step 4: Configure Claude Code to Use the Bridge](#step-4-configure-claude-code-to-use-the-bridge)
-  - [Step 5: Start the Bridge Daemon](#step-5-start-the-bridge-daemon)
-  - [Step 6: Launch Claude Code](#step-6-launch-claude-code)
-- [How to Start a Fresh / New Chat Thread](#how-to-start-a-fresh--new-chat-thread)
-- [CLI & Alternative Usage](#cli--alternative-usage)
-  - [One-Shot CLI Prompting](#one-shot-cli-prompting)
-  - [OpenAI-Compatible Endpoint (Cursor, Aider, Continue)](#openai-compatible-endpoint-cursor-aider-continue)
-- [VPN & Location Guard (Spain / EU Access)](#vpn--location-guard-spain--eu-access)
-- [Diagnostics & Troubleshooting](#diagnostics--troubleshooting)
-- [Security](#security)
+MuseBridge makes [Muse](https://muse.ai) (Meta's personal AI agent) look like the Claude API,
+so apps such as **OpenCode** and **ZadLoop** can talk to it. You chat in the app you already use;
+Muse reads, thinks, and acts step by step, and everything streams back live.
+
+![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square)
+![Works with](https://img.shields.io/badge/works%20with-OpenCode%20%C2%B7%20ZadLoop-7C3AED?style=flat-square)
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square)
+![Setup](https://img.shields.io/badge/setup-one%20click-3fb950?style=flat-square)
+
+<img src="docs/architecture.svg" width="760" alt="How MuseBridge works">
+
+</div>
 
 ---
 
-## Overview
+## ✨ What you get
 
-Claude Code normally requires a paid Anthropic API key or subscription. This bridge acts as a local drop-in Anthropic Messages API server (`http://127.0.0.1:8765/v1/messages`). 
+| | |
+|---|---|
+| 🧠 **Muse in your editor** | Pick “Muse” as the model in OpenCode or ZadLoop and chat normally. |
+| 👣 **Live steps** | See what Muse is doing while it works — each step with its title and detail, in the collapsible “thinking” panel. |
+| 💬 **A chat per session** | Every session in your app gets its own Muse chat. Reopen a session and it continues where it left off; start a new one and Muse starts fresh. |
+| 🖼️ **Images** | Attach a screenshot in your app and it goes to Muse with your message. |
+| ✅ **Waits for the real answer** | Muse is an agent — it sometimes says “on it, give me a sec”. MuseBridge waits for the job to actually finish before showing the answer. |
+| 🎨 **Proper formatting** | Headings, **bold**, lists, tables and code blocks come through with colours and syntax highlighting. |
+| 💸 **No API bill** | It uses *your own* Muse plan through a real browser tab. Everything runs on `localhost` — nothing is sent to any third party. |
 
-Whenever Claude Code sends a prompt, the bridge:
-1. Translates the prompt and injects your real local workspace context.
-2. Automates a headless Chromium session to query Muse AI on `muse.ai`.
-3. Monitors Muse's active generation indicator (`...`) and handles streaming.
-4. Intercepts file creation cards, code fences, deletions, reads, and commands, translating them into native Anthropic `tool_use` events for Claude Code.
-
----
-
-## The 5 Harness Pillars
-
-The bridge is designed as a complete coding harness supporting the entire software development lifecycle:
-
-1. **GENERATE**:
-   - Multi-file card & markdown fence extraction (`parse_cards_and_fences`).
-   - Extracts all files emitted in a single turn without dropping secondary files or polluting source code with conversational chatter.
-2. **DELETE**:
-   - Supports direct deletion intents in English and Spanish (`delete the files in the folder`, `clear folder`, `borra temp.txt`, `elimina los archivos`, etc.).
-   - Converts delete requests to PowerShell `Remove-Item -Path ... -Recurse -Force` on Windows or `rm -rf` on POSIX.
-   - Automatically handles empty folders immediately to prevent empty tool call hangs.
-3. **READ**:
-   - Direct workspace inspection (`list files`, `dump all file contents`).
-   - Detects referenced local files on your PC and injects their real contents into Muse's prompt for analysis.
-4. **WRITE**:
-   - Targeted file modification: reads existing disk files, prompts Muse for the solution, and emits a clean `Write` tool call with the updated code.
-5. **EXECUTE**:
-   - Shell command detection: recognizes execution prompts (`pytest`, `python script.py`, `npm test`, `git status`, `run ...`, `ejecuta ...`) and emits `PowerShell` / `Bash` tool calls.
+<div align="center">
+<img src="docs/thinking-example.svg" width="620" alt="Live steps, then the answer">
+<br><em>Live steps stream in while Muse works, then the final answer appears below.</em>
+</div>
 
 ---
 
-## Complete Step-by-Step Setup
+## 🧩 How it works (in plain words)
 
-### Step 1: Prerequisites & Installation
+1. You type a request in **OpenCode** or **ZadLoop** and choose **Muse** as the model.
+2. MuseBridge, running quietly on your PC, receives it **as if it were the Claude API**.
+3. It types your message into a real **Muse browser tab** that stays logged in to your account.
+4. Muse does the work. MuseBridge watches the page and **streams the steps and the answer back** to your app.
 
-Ensure you have **Python 3.10+** and **Git** installed.
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/Some1sm/MuseBridge.git
-   cd MuseBridge
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install playwright
-   playwright install chromium
-   ```
-
-3. Ensure Claude Code CLI is installed:
-   ```bash
-   npm install -g @anthropic-ai/claude-code
-   ```
+No account except your own is involved, and nothing leaves your computer except your chat with Muse.
 
 ---
 
-### Step 2: One-Time Login & Selector Discovery
+## ✅ Before you start
 
-Run the automated login setup:
-```bash
-python muse_bridge.py login
+You need three things:
+
+- A **Windows** PC.
+- A **Muse account** (free or paid) — [muse.ai](https://muse.ai).
+- **Python 3.10 or newer** — [download here](https://www.python.org/downloads/).
+  👉 During install, tick the box **“Add python.exe to PATH.”** That one tick saves a lot of trouble.
+
+That’s it. You do **not** need to be a developer.
+
+---
+
+## 🚀 Install (step by step)
+
+### 1. Get the files
+Click the green **Code** button at the top of this page → **Download ZIP** → unzip it somewhere easy,
+like your Desktop. (If you know Git, `git clone` works too.)
+
+### 2. Run the one-click setup
+Open the folder and **double-click `setup.bat`**.
+A black window opens and installs everything MuseBridge needs into its own private folder.
+Wait for **“Setup complete!”**, then close it. *(You only do this once.)*
+
+### 3. Sign in to Muse
+**Double-click `login_to_muse.bat`.** A browser window opens.
+- Log in to your Muse account.
+- Open the chat you want to use.
+- **Close the window.** Your login is saved automatically — no buttons to press.
+
+### 4. Start the bridge
+**Double-click `start_muse_bridge_venv.bat`.**
+Leave this window open — it’s the engine. When you see
+`HTTP Server listening at http://127.0.0.1:8765`, it’s ready.
+
+> 💡 Want it to start by itself every time you turn on your PC? See **[Keep it always on](#-keep-it-always-on)** below.
+
+---
+
+## 🔌 Connect it to your app
+
+MuseBridge listens at **`http://127.0.0.1:8765`**. Add it as a model provider.
+
+### OpenCode
+
+Open `C:\Users\<you>\.config\opencode\opencode.json` and add a provider:
+
+```jsonc
+{
+  "provider": {
+    "muse": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Muse",
+      "options": { "baseURL": "http://127.0.0.1:8765/v1", "apiKey": "muse-bridge-local" },
+      "models": { "muse": { "name": "Muse", "tool_call": false } }
+    }
+  }
+}
 ```
 
-1. A Chromium browser window will open at `https://muse.ai`.
-2. Log into your Muse / Meta account.
-3. Open or start the chat thread you want to use.
-4. Return to your terminal and press **ENTER**.
+Restart OpenCode, pick **Muse**, and chat. To see the live steps, make sure thinking is shown
+(`"thinking": "show"` in OpenCode’s `cli.json`).
 
-The bridge **automatically detects all DOM selectors** (chat composer, send button, message bubbles) and saves your authenticated session to `storage_state.json` and `bridge_config.json`. You do not need to inspect HTML manually.
+### ZadLoop / DeepSeek Harness
 
----
+In ZadLoop’s profile file `…\ZadLoop\harness\profiles\web\cordis.patch.yml`, under the
+`llm-pi-ai` providers, add:
 
-### Step 3: Crucial! Configure Muse `SOUL.md` & `MEMORY.md`
-
-> [!IMPORTANT]
-> **Why this step is critical:**
-> Muse AI has built-in persona files (`SOUL.md` and `MEMORY.md`) that it reads before every conversation. By default, Muse believes it is an autonomous agent operating inside a private cloud container (`~/workspace/`). If left unedited, Muse may hallucinate that it is "building in ~/workspace in the background" and fail to output code in the chat.
-> 
-> Editing these two files in Muse permanently aligns it as an AI coding engine paired with Claude Code.
-
-In Muse's web interface, open your settings/files and update:
-
-#### 1. `SOUL.md`
-Copy and paste this into Muse's **`SOUL.md`**:
-
-```markdown
-# SOUL.md
-
-You are the Lead Autonomous AI Coding Engine paired with Claude Code on the user's computer via MuseBridge.
-
-You are not a chatbot; you are an elite systems architect and senior software engineer. Your responses directly drive an automated execution harness on the user's local machine.
-
-### Operating Principles
-
-1. **You Have No Private Cloud Sandbox**
-   You do NOT have a private `~/workspace/` directory or a background terminal runner of your own. Never state "building it now in ~/workspace", "stored in workspace", or "reporting back later". Any file or command you intend to create must be delivered directly in your response so Claude Code can write or execute it on the user's machine immediately.
-
-2. **Direct Code Delivery Protocol**
-   When requested to create, edit, or generate code, deliver complete, unabridged, production-grade files. Never provide stubs, placeholders, `// TODO`, or truncated code.
-   Always format each file using standard markdown code blocks with the file's path clearly indicated in the heading:
-   ### `src/server.js`
-   ```javascript
-   // Full production implementation
-   ```
-   If multiple files are requested, output all files in logical order or structured batches without conversational filler.
-
-3. **Tool & Command Execution Protocol**
-   When you need to execute commands on the user's machine (tests, builds, installs, scripts), output clean, executable shell blocks:
-   ```powershell
-   npm test
-   ```
-   or
-   ```bash
-   npm run build
-   ```
-   Claude Code will execute them directly in the project directory on Windows.
-
-4. **Resourcefulness & Context Alignment**
-   Always inspect the provided project files, dependencies, and architecture before proposing changes. Match existing naming conventions, code style, and error handling idioms.
-
-5. **No Filler, Pure Signal**
-   Skip conversational pleasantries ("Certainly!", "I'd be happy to help!"). Begin immediately with the analysis, command, or file deliverables.
+```yaml
+muse:
+  displayName: Muse
+  api: anthropic-messages
+  baseURL: http://127.0.0.1:8765
+  apiKeyEnv: MUSE_BRIDGE_KEY        # any saved credential name; the value isn't checked
+  models:
+    - id: muse
+      name: Muse AI
+      contextWindow: 200000
+      maxTokens: 16384
+      input: [text, image]
 ```
 
-#### 2. `MEMORY.md`
-Copy and paste this into Muse's **`MEMORY.md`**:
+Pick **Muse** as the model and chat.
 
-```markdown
-<!-- Your curated long-term memory: durable facts, preferences, and commitments. -->
+### Claude Code
 
-## Facts
-- **Primary Interface**: Connected to the user's local terminal via Claude Code and the `MuseBridge` daemon (`http://127.0.0.1:8765`).
-- **Target Environment**: Windows / macOS / Linux host with terminal execution; project directories located at your local workspace root (e.g. `C:\projects\...` or `~/projects/...`).
-- **Execution Model**: Claude Code executes all file writes (`Write`), file reads (`Read`), file deletions (`PowerShell Remove-Item`), and commands (`PowerShell`/`Bash`) locally on the machine. Muse acts as the brain and code generator.
-- **Delivery Mechanism**: Muse outputs files directly in chat responses using markdown blocks (`### filepath` + ```lang ... ```); MuseBridge parses these and emits `tool_use` actions to Claude Code.
-
-## Preferences
-- Bilingual: fully fluent in English and Spanish; responds in the language prompted.
-- Complete implementations: zero placeholders, no omitted functions, no `// TODO` stubs.
-- Direct code outputs: never defer to a remote cloud `~/workspace/` or background runner; always provide immediate code deliverables in the turn.
-```
+Double-click **`claude_muse.bat`** from inside any project folder. It opens Claude Code pointed at
+Muse for that window only — your normal Claude Code is untouched.
 
 ---
 
-### Step 4: Configure Claude Code to Use the Bridge
+## 🗓️ Using it day to day
 
-You can configure Claude Code in two ways:
-
-#### Option A: Using the Provider Switcher (Recommended)
-Use `switch_provider.py` to point Claude Code to the bridge with one command:
-```bash
-python switch_provider.py muse
-```
-*(You can switch back to OpenRouter or native Anthropic anytime with `python switch_provider.py openrouter` or check status with `python switch_provider.py status`)*.
-
-#### Option B: Environment Variables
-Alternatively, set the standard Anthropic base URL in your terminal:
-
-**PowerShell (Windows)**:
-```powershell
-$env:ANTHROPIC_BASE_URL="http://127.0.0.1:8765"
-$env:ANTHROPIC_API_KEY="muse-bridge-local"
-```
-
-**Bash / Zsh (macOS/Linux)**:
-```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8765"
-export ANTHROPIC_API_KEY="muse-bridge-local"
-```
+- Make sure the **bridge window is running** (step 4), then use your app normally.
+- Ask Muse anything. You’ll see the **steps** as it works, then the **answer**.
+- Each session in your app keeps its **own Muse chat**, so context carries over when you reopen it.
 
 ---
 
-### Step 5: Start the Bridge Daemon
+## 🔁 Switching Muse accounts
 
-Start the bridge server in your terminal:
-```bash
-python muse_bridge.py serve
-```
-*(On Windows, you can also double-click `start_muse_bridge.bat`)*.
+Your login lives in `storage_state.json`. To keep two accounts:
 
-The server will initialize headless Playwright, navigate to your chat thread, and begin listening for requests on:
-```
-http://127.0.0.1:8765
-```
+1. After logging in, copy `storage_state.json` to e.g. `storage_state.main.json`.
+2. Log in with the other account, copy it to `storage_state.test.json`.
+3. To switch, copy the one you want **over** `storage_state.json` and restart the bridge.
 
 ---
 
-### Step 6: Launch Claude Code
+## 🔧 Keep it always on
 
-In a new terminal window, navigate to your target project folder (e.g. `C:\projects\MyProject` or `~/my-project`) and run:
-```bash
-claude
-```
+So the bridge starts hidden every time you log in to Windows:
 
-You can now use Claude Code completely free!
-- Ask it to generate full projects or multiple files: *"Create a full Express server in server.js and a package.json"*.
-- Ask it to read local files: *"What does index.html do?"*.
-- Ask it to edit or fix files: *"Add JWT authentication to auth.js"*.
-- Ask it to delete files: *"Delete the temporary files in this folder"*.
-- Ask it to run tests or commands: *"Run npm test"*.
+1. Press `Win + R`, type `shell:startup`, press Enter — the Startup folder opens.
+2. Right-click `autostart_bridge.ps1` → **Create shortcut**, and move the shortcut into that folder.
+
+Now it runs in the background and restarts itself if it ever stops. Its log is `bridge.log`.
 
 ---
 
----
+## 🩹 Troubleshooting
 
-## How to Start a Fresh / New Chat Thread
+| Problem | Fix |
+|---|---|
+| **`Python is not installed`** when running `setup.bat` | Install Python and tick *Add to PATH*, then run `setup.bat` again. |
+| **The app says it can’t reach the model** | Is the bridge window (step 4) still open? Restart it with `start_muse_bridge_venv.bat`. |
+| **Replies stopped working after a while** | Your Muse login expired. Run `login_to_muse.bat` again and close the window after signing in. |
+| **Muse answers in its own chat but the app shows nothing** | Make sure you opened a chat before closing the login window. Re-run `login_to_muse.bat`. |
+| **I don’t see the steps** | Turn on “thinking” in your app (OpenCode: `"thinking": "show"`; ZadLoop shows it by default). |
 
-When your chat session in Muse gets long or cluttered, you can switch threads instantly without even restarting the daemon:
-
-### Option 1: Live Switch via HTTP Endpoint (Instant, Zero Restart)
-1. In Muse's web interface, click **New side chat** (or the **`+`** button).
-2. Copy the new URL from your browser's address bar (e.g., `https://muse.ai/thread/YOUR-NEW-ID`).
-3. Send a quick POST request to switch the daemon's active page:
-   ```bash
-   # Windows PowerShell
-   Invoke-RestMethod -Uri "http://127.0.0.1:8765/chat_url" -Method Post -ContentType "application/json" -Body '{"url": "https://muse.ai/thread/YOUR-NEW-ID"}'
-
-   # Bash / Curl
-   curl -X POST http://127.0.0.1:8765/chat_url -H "Content-Type: application/json" -d '{"url": "https://muse.ai/thread/YOUR-NEW-ID"}'
-   ```
-   Or to reset to a brand new conversation at `https://muse.ai/`:
-   ```bash
-   curl -X POST http://127.0.0.1:8765/reset
-   ```
-   The browser navigates immediately and persists the new thread in `bridge_config.json`.
-
-### Option 2: Update `bridge_config.json`
-1. Open `bridge_config.json` in the `MuseAIBridge` folder:
-   ```json
-   {
-     "chat_url": "https://muse.ai/thread/YOUR-NEW-ID",
-     "port": 8765,
-     "headless": true,
-     "timeout": 600
-   }
-   ```
-2. Restart the daemon (`python muse_bridge.py serve`).
+More knobs live in `bridge_config.json` (created on first login) — for example
+`"detailed_steps": false` to show step titles only, or `"stream_progress": false` to hide steps entirely.
 
 ---
 
-## Automatic Project Dumping to Your Local Workspace
+## 🔒 A note on safety
 
-> **"If Muse creates a project, will it automatically dump it onto our workspace on the device?"**
-> 
-> **YES!** Here is how the automated harness works:
-
-1. **Anti-Hallucination Guard**:
-   By default, Muse may try to say *"I've built the project in ~/workspace/ and will report back."*
-   MuseBridge intercepts this pattern immediately and automatically sends a high-priority harness re-prompt:
-   *"I need the project on my local computer. Please package all files from your workspace as a downloadable archive (tar.gz or zip), or output the files with their filenames and complete code in markdown code blocks..."*
-2. **Direct Disk Extraction**:
-   - If Muse attaches a `.tar.gz` or `.zip` archive card, MuseBridge automatically downloads it in Chromium, uncompresses all files, and writes them directly into your current working directory (`cwd`).
-   - If Muse outputs files using markdown fences or Muse native file cards (`### filename.ext` + ` ```lang ... ``` `), MuseBridge extracts each file and writes it to disk or emits Claude Code native `Write` tool calls.
-3. **Keyword-Aware File Edits**:
-   When you ask Claude Code to edit a component (e.g. *"from my local files can you please add a status indicator banner to index.html"*), the bridge automatically searches your local workspace files for matching terms, attaches the file context to Muse, and emits a targeted `Write` tool call to update the file on your disk.
+- Everything runs on **`localhost`**. MuseBridge never sends your data anywhere except your own Muse chat.
+- Your Muse login (`storage_state.json`) and settings (`bridge_config.json`) stay on your PC and are
+  **ignored by Git** — they’re never uploaded.
+- If you let Muse act on your PC through a connector, treat it like any assistant with access: keep an
+  eye on what it runs.
 
 ---
 
-## CLI & Alternative Usage
+## 🙏 Credits
 
-### One-Shot CLI Prompting
-You can interact with Muse directly from your command line without Claude Code:
-```bash
-# Send a prompt and print the response
-python muse_bridge.py send "Write a Python script to calculate Fibonacci numbers"
-
-# Read the last 5 messages from the thread
-python muse_bridge.py read --limit 5
-```
-
-### OpenAI-Compatible Endpoint (Cursor, Aider, Continue)
-The bridge also exposes an OpenAI-compatible endpoint:
-- **Base URL**: `http://127.0.0.1:8765/v1`
-- **Model**: `muse`
-- **Chat Endpoint**: `POST http://127.0.0.1:8765/v1/chat/completions`
-
-Configure Cursor, Continue, or Aider to use `http://127.0.0.1:8765/v1` as the OpenAI Base URL with API Key `anything`.
-
----
-
-## VPN & Location Guard (Spain / EU Access)
-
-Muse restricts access in certain countries (including Spain). The bridge includes native circumvention:
-
-1. **Built-in Location Spoofing**:
-   The bridge automatically spoofs browser geolocation to New York (`40.7128, -74.0060`), sets timezone to `America/New_York`, and configures `en-US` locale. You do not need the Location Guard browser extension in Playwright.
-
-2. **System-wide VPN**:
-   If using a desktop VPN (e.g. ProtonVPN, Mullvad, NordVPN, WireGuard), simply connect to a US or supported server before running `login` or starting the daemon.
-
-3. **Chrome DevTools Protocol (CDP)**:
-   If you prefer using your existing desktop Chrome browser with active VPN extensions:
-   ```bash
-   # Launch Chrome with remote debugging
-   chrome.exe --remote-debugging-port=9222
-   ```
-   Then attach the bridge:
-   ```bash
-   python muse_bridge.py login --cdp http://127.0.0.1:9222
-   ```
-
----
-
-## Diagnostics & Troubleshooting
-
-- **Inspect DOM & Element Selectors**:
-  ```bash
-  python muse_bridge.py inspect
-  ```
-  Navigates to your configured chat, takes `debug_screenshot.png`, and prints detected selector details.
-
-- **Session Expired / Logged Out**:
-  If your cookies expire, simply re-run:
-  ```bash
-  python muse_bridge.py login
-  ```
-
-- **Viewing What Muse is Doing Live**:
-  Set `"headless": false` in `bridge_config.json` or pass `--headful` to see the real Chromium browser window while it works:
-  ```bash
-  python muse_bridge.py serve --headful
-  ```
-
-- **Large Generation Timeouts**:
-  The bridge defaults to a generous **600-second (10-minute) timeout** and automatically pauses completion checks while Muse's active thinking/loading dots (`...`) are animating.
-
----
-
-## Security
-
-- `storage_state.json` contains your active session cookies and is gitignored.
-- `bridge_config.json` contains your private thread ID and local port settings.
-- Do not commit or share these files.
+Built on the original [**MuseBridge** by Some1sm](https://github.com/Some1sm/MuseBridge).
+This version adds live step-streaming, per-session chats, image attachments, readable “thinking”
+formatting, OpenCode & ZadLoop support, and one-click setup.
