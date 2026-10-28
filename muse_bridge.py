@@ -1547,11 +1547,64 @@ def sessions_set(key: str, thread_url: str) -> None:
             print(f"[!] Could not save session map: {e}", file=sys.stderr, flush=True)
 
 
+def _dump_last_request(path: str, headers: dict, payload: dict) -> None:
+    """Save the latest client request (images elided) to debug_last_request.json for diagnosis."""
+    try:
+        def elide(o):
+            if isinstance(o, dict):
+                return {k: ("<base64 elided>" if k == "data" and isinstance(v, str) and len(v) > 200 else elide(v)) for k, v in o.items()}
+            if isinstance(o, list):
+                return [elide(x) for x in o]
+            return o
+        safe_headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "x-api-key")}
+        with open(BASE_DIR / "debug_last_request.json", "w", encoding="utf-8") as f:
+            json.dump({"path": path, "headers": safe_headers, "payload": elide(payload)}, f, indent=1, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+# Bookkeeping notes some harnesses (DeepSeek Harness / ZadLoop) add to the user's turn. They are
+# for a model that sees the whole transcript; sent to Muse they read as the user's message.
+_HARNESS_NOTE_PATTERNS = [
+    r"(?m)^\s*Time sampled while preparing turn[^\n]*\n?",
+    r"(?m)^\s*Browser time zone for this request:[^\n]*\n?",
+    r"(?m)^\s*Elapsed since the preceding model-visible message:[^\n]*\n?",
+    r"\[model changed:[^\]]*\]",
+]
+
+
 def strip_system_tags(text: str) -> str:
-    """Remove <system-reminder>...</system-reminder> and unwrap <pasted_content> tags injected by Claude Code."""
+    """Remove <system-reminder>...</system-reminder>, unwrap <pasted_content>, and drop harness bookkeeping notes."""
     cleaned = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"<pasted_content[^>]*>(.*?)</pasted_content[^>]*>", r"\1", cleaned, flags=re.DOTALL)
+    for pat in _HARNESS_NOTE_PATTERNS:
+        cleaned = re.sub(pat, "", cleaned)
     return cleaned.strip()
+
+
+def current_turn_user_text(messages: List[dict]) -> str:
+    """Text of the user messages after the last assistant turn, harness notes removed.
+
+    Some harnesses send the user's words and a separate note-only user message in the same turn;
+    reading just the last user message would hand Muse the note instead of the request.
+    """
+    tail: List[str] = []
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            break
+        if m.get("role") != "user":
+            continue
+        c = m.get("content", "")
+        if isinstance(c, list):
+            c = "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+        t = strip_system_tags(str(c))
+        if t.startswith("Current runtime context"):
+            # ZadLoop's per-turn snapshot is mostly its delegation-fleet setup; Muse only needs the cwd.
+            mcwd = re.search(r'Current working directory:\s*"?([^"\n]+)"?', t)
+            t = f"(Working directory: {mcwd.group(1).replace(chr(92) * 2, chr(92))})" if mcwd else ""
+        if t:
+            tail.append(t)
+    return "\n\n".join(reversed(tail))
 
 
 def is_title_generation_query(prompt: str) -> bool:
@@ -2386,12 +2439,10 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                 msgs = mgr.get_messages(limit=limit)
                 self._send_json(200, {"status": "ok", "messages": msgs})
             elif clean_path in ("/v1/models", "/models", "/api/v1/models", "/api/models"):
+                # Only the one real model: extra aliases (all Muse underneath) made model-discovery
+                # clients like ZadLoop list fake "Sonnet 3.7" models and inject "[model changed]" notes.
                 models_list = [
                     {"id": "muse", "type": "model", "object": "model", "display_name": "Muse AI"},
-                    {"id": "stealth/union-alpha", "type": "model", "object": "model", "display_name": "Stealth Union Alpha"},
-                    {"id": "claude-3-7-sonnet", "type": "model", "object": "model", "display_name": "Claude 3.7 Sonnet"},
-                    {"id": "claude-3-5-sonnet-20241022", "type": "model", "object": "model", "display_name": "Claude 3.5 Sonnet"},
-                    {"id": "claude-3-5-haiku-20241022", "type": "model", "object": "model", "display_name": "Claude 3.5 Haiku"},
                 ]
                 self._send_json(200, {"data": models_list})
             else:
@@ -2405,6 +2456,9 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                 payload = json.loads(raw_body)
             except Exception:
                 payload = {}
+
+            if clean_path.endswith("/messages") or clean_path.endswith("/chat/completions"):
+                _dump_last_request(clean_path, dict(self.headers), payload)
 
             if clean_path == "/chat_url":
                 new_url = payload.get("url") or payload.get("chat_url", "")
@@ -2742,6 +2796,9 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                     return res_box.get("reply", ""), res_box.get("extracted", [])
 
                 clean_last_user_msg = strip_system_tags(last_user_msg) if last_user_msg else ""
+                if not clean_last_user_msg and not is_tool_result:
+                    # Last user message was only harness notes; the request is earlier in this turn.
+                    clean_last_user_msg = current_turn_user_text(messages)
                 tools_to_emit: List[Tuple[str, dict]] = []
                 thought = ""
                 if is_tool_result:
@@ -2917,7 +2974,14 @@ def run_daemon_server(mgr: BrowserManager, port: int) -> None:
                             session_key = ""
                             is_new_session = False
                             if chat_only:
-                                session_key = session_key_for(messages, cwd)
+                                # Prefer the client's own session id header (ZadLoop/OpenCode can send one);
+                                # fall back to first message + working dir.
+                                sid = (self.headers.get("x-zadloop-session") or self.headers.get("x-opencode-session")
+                                       or self.headers.get("x-session-id") or "").strip()
+                                if sid:
+                                    session_key = hashlib.sha1(("hdr:" + sid).encode("utf-8")).hexdigest()[:16]
+                                else:
+                                    session_key = session_key_for(messages, cwd)
                                 mapped = sessions_get(session_key)
                                 if mapped and "/thread/" in mapped:
                                     print(f"[*] Session {session_key}: continuing {mapped}", file=sys.stderr, flush=True)
